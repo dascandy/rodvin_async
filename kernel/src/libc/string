@@ -1,0 +1,361 @@
+#ifndef STRING_H
+#define STRING_H
+
+#include <string.h>
+#include <stdint.h>
+#include <algorithm>
+#include <stdio.h>
+#include <vector>
+
+namespace rodvin {
+
+// String class, similar to std::string with the noted exceptions:
+// - Does not hold untyped data, but strict UTF8.
+// - Has initializers that decode UTF16 and UTF32 to UTF8.
+// - Length refers to the code point count, size refers to the byte count. 
+// - All other access is done in code points (making operator[] much less efficient than iterators).
+// - getByte is present to replace the old function of operator[] and to get the underlying storage.
+// - Is not a template. This means that part of the implementation is not in the header file, speeding up compilation and shrinking outputs.
+class string {
+public:
+  // Destructor
+  ~string() __attribute__((always_inline)) {
+    if (!isLocal())
+      delete [] u.s.storage_;
+  }
+
+  // Constructors
+  string() __attribute__((always_inline)) {
+    u.localStorage_[0] = u.localStorage_[1] = 0;
+  }
+  string(const string& str) : string() {
+    assign(str.data(), npos);
+  }
+  string(const string& str, size_t pos, size_t len = npos) : string() {
+    assign(str.data() + pos, len);
+  }
+  string(const char* data) : string() {
+    assign(data, strlen(data));
+  }
+  string(const char* s, size_t n) : string() {
+    assign(s, n);
+  }
+  string(size_t n, uint32_t c) : string() {
+    resize(n, c);
+  }
+  template <typename Iterator>
+  string(Iterator it, Iterator e) 
+  : string()
+  {
+    for (; it != e; ++it) {
+      push_back(*it);
+    }
+  }
+  // Additional constructors, for initializing with UTF16 or UTF32 contents.
+  string(uint16_t *data) : string() {
+    while (*data) {
+      push_back(getUtf16Char(data));
+    }
+  }
+  string(uint32_t *data) : string() {
+    while (*data) {
+      push_back(*data++);
+    }
+  }
+
+  // operator= variants (forwarding to assign)
+  string& operator=(const char* str) {
+    return assign(str, strlen(str));
+  }
+  string& operator=(const string& str) {
+    return assign(str.data(), str.size());
+  }
+  string& operator=(char c) {
+    return assign(&c, 1);
+  }
+  string& assign(const char* str, size_t n) {
+    if (n == npos) n = strlen(str);
+    reserve(n);
+    setSize(n);
+    memcpy(data(), str, n);
+    data()[n] = 0;
+    return *this;
+  }
+  string& operator+=(const string& str) {
+    printf("%p %u %u\n", data(), size(), capacity());
+    reserve(size() + str.size());
+    printf("%p %u %u\n", data(), size(), capacity());
+    memcpy(data() + size(), str.data(), str.size());
+    printf("%p %u %u\n", data(), size(), capacity());
+    setSize(size() + str.size());
+    printf("%p %u %u\n", data(), size(), capacity());
+    data()[size()] = 0;
+    printf("%p %u %u\n", data(), size(), capacity());
+    return *this;
+  }
+  string operator+(const string& str) {
+    string c;
+    printf("%s %u %u\n", c.data(), c.size(), c.capacity());
+    c.reserve(size() + str.size());
+    printf("%s %u %u\n", c.data(), c.size(), c.capacity());
+    c.data()[size() + str.size()] = 0;
+    printf("%s %u %u\n", c.data(), c.size(), c.capacity());
+    memcpy(c.data(), data(), size());
+    printf("%s %u %u\n", c.data(), c.size(), c.capacity());
+    memcpy(c.data() + size(), str.data(), str.size());
+    printf("%s %u %u\n", c.data(), c.size(), c.capacity());
+    c.setSize(size() + str.size());
+    printf("%s %u %u\n", c.data(), c.size(), c.capacity());
+    return c;
+  }
+  string substr(size_t start, size_t n = npos) const {
+    size_t bytesToCopy = n == npos ? size() - start : n;
+    return string(data() + start, bytesToCopy);
+  }
+  string &replace(size_t start, size_t length, const string& replaceant) {
+    int delta = replaceant.size() - length;
+    size_t newSize = size() + delta;
+    if (newSize > capacity()) reserve(newSize);
+    memmove(data() + start + replaceant.size(), data() + start + length, size() - length - start);
+    memcpy(data() + start, replaceant.data(), replaceant.size());
+    setSize(size() + delta);
+    data()[size()] = 0;
+    return *this;
+  }
+  friend bool operator==(const string& a, const string& b) {
+    if (a.size() != b.size()) return false;
+    size_t n = 0;
+    while (a.data()[n] == b.data()[n] && n < b.size()) n++;
+    return n == b.size();
+  }
+  bool operator!=(const string& s) const {
+    return !(*this == s);
+  }
+  size_t length() const {
+    size_t len = 0;
+    for (size_t offset = 0; offset < size(); offset++) {
+      if ((data()[offset] & 0xC0) != 0x80)
+        len++;
+    }
+    return len;
+  }
+  void pop_back() {
+    do {
+      setSize(size() - 1);
+    } while ((data()[size() - 1] & 0xC0) == 0x80);
+
+    setSize(size() - 1);
+  }
+  static const size_t npos = (size_t)-1;
+  size_t find(const char *c, size_t pos = 0) const {
+    char* v = strstr(data()+pos, c);
+    if (!v) return npos;
+    return (v - data());
+  }
+  size_t find(const string& s, size_t pos = 0) const {
+    return find(s.data(), pos);
+  }
+  size_t find(uint32_t ch, size_t pos = 0) const {
+    uint32_t str[2] = { ch, 0 };
+    return find(string(str), pos);
+  }
+  size_t find_first_not_of(const string& s) const {
+    for (const_iterator it = begin(); it != end(); ++it) {
+      if (s.find(*it) == npos)
+        return it.offset;
+    }
+    return npos;
+  }
+  uint8_t getByte(size_t offset) const {
+    if (isLocal()) return u.localStorage_[offset];
+    return u.s.storage_[offset];
+  }
+  struct const_iterator {
+    const_iterator(const string* str, size_t offset)
+    : str(str)
+    , offset(offset)
+    {}
+    const_iterator& operator++() {
+      offset++;
+      while ((str->getByte(offset) & 0xC0) == 0x80) offset++;
+      return *this;
+    }
+    const_iterator& operator--() {
+      offset--;
+      while ((str->getByte(offset) & 0xC0) == 0x80) offset--;
+      return *this;
+    }
+    uint32_t operator*() {
+      uint32_t v = str->getByte(offset);
+      if (v < 0x80) {
+        return v;
+      } else if (v < 0xE0) {
+        return ((v & 0x1F) << 6) |
+               ((str->getByte(offset+1) & 0x3F) << 0);
+      } else if (v < 0xF0) {
+        return ((v & 0x0F) << 12) |
+               ((str->getByte(offset+1) & 0x3F) << 6) |
+               ((str->getByte(offset+2) & 0x3F) << 0);
+      } else {
+        return ((v & 0x07) << 18) |
+               ((str->getByte(offset+1) & 0x3F) << 12) |
+               ((str->getByte(offset+2) & 0x3F) << 6) |
+               ((str->getByte(offset+3) & 0x3F) << 0);
+      }
+    }
+    bool operator==(const const_iterator& it) const {
+      return (str == it.str &&
+              offset == it.offset);
+    }
+    bool operator!=(const const_iterator& it) const {
+      return !(*this == it);
+    }
+    const string* str;
+    size_t offset;
+  };
+  const_iterator begin() const {
+    return const_iterator(this, 0);
+  }
+  const_iterator end() const {
+    return const_iterator(this, size());
+  }
+  void push_back(uint32_t wchar) {
+    size_t bytesAdded = (wchar <= 0x7F ? 1 :
+                         wchar <= 0x7FF ? 2 :
+                         wchar <= 0xFFFF ? 3 : 4);
+    size_t cap = capacity();
+    if (cap < size() + bytesAdded) {
+      reserve(cap + cap / (cap >= 240 ? 2 : 1));
+    }
+
+    char* target = data() + size();
+    target[bytesAdded] = 0;
+
+    switch(bytesAdded) {
+    case 1:
+      target[0] = (char)wchar;
+      break;
+    case 2:
+      target[0] = (char)(((wchar >>  6) & 0x1F) | 0xC0);
+      target[1] = (char)(((wchar >>  0) & 0x3F) | 0x80);
+      break;
+    case 3:
+      target[0] = (char)(((wchar >> 12) & 0x0F) | 0xE0);
+      target[1] = (char)(((wchar >>  6) & 0x3F) | 0x80);
+      target[2] = (char)(((wchar >>  0) & 0x3F) | 0x80);
+      break;
+    case 4:
+      target[0] = (char)(((wchar >> 18) & 0x07) | 0xF0);
+      target[1] = (char)(((wchar >> 12) & 0x3F) | 0x80);
+      target[2] = (char)(((wchar >>  6) & 0x3F) | 0x80);
+      target[3] = (char)(((wchar >>  0) & 0x3F) | 0x80);
+      break;
+    }
+    setSize(size() + bytesAdded);
+  }
+  std::vector<string> split(uint32_t separator = ' ') const;
+
+  void shrink_to_fit() {
+    // Policy is to shrink only if you can either save 12% or more, or if you can go back to internal storage.
+    if (size() <= 30 && !isLocal()) {
+      char* storage = u.s.storage_;
+      u.localStorage_[0] = size();
+      memcpy(u.localStorage_ + 1, storage, size());
+      delete [] storage;
+    } else if (size() + size() / 8 < capacity()) {
+      // TODO
+    }
+  }
+
+  void reserve(size_t newSize) {
+    if (newSize <= capacity())
+      return;
+
+    char* storage = new char[newSize+1];
+    memcpy(storage, data(), size()+1);
+    if (isLocal()) {
+      u.localStorage_[0] = 127;
+    } else {
+      delete [] u.s.storage_;
+    }
+    u.s.capacity_ = u.s.size_ = newSize;
+    u.s.storage_ = storage;
+  }
+  void resize(size_t newSize, char c = 0) {
+    reserve(newSize);
+
+    if (newSize > size())
+      memset(data() + size(), c, newSize - size() + 1);
+    else
+      data()[newSize] = 0;
+    
+    setSize(newSize);
+  }
+  void clear() {
+    data()[0] = 0;
+    setSize(0);
+  }
+  char *data() noexcept {
+    if (isLocal()) return u.localStorage_ + 1;
+    return u.s.storage_;
+  }
+  const char *data() const noexcept {
+    if (isLocal()) return u.localStorage_ + 1;
+    return u.s.storage_;
+  }
+  size_t size() const noexcept { 
+    if (isLocal()) return u.localStorage_[0];
+    return u.s.size_;
+  }
+  size_t capacity() const noexcept {
+    if (isLocal()) return 30;
+    return u.s.capacity_;
+  }
+  bool empty() const noexcept {
+    return size() == 0;
+  }
+  bool isLocal() const noexcept {
+    return u.localStorage_[0] <= 30;
+  }
+  void setSize(size_t newSize) {
+    if (isLocal()) u.localStorage_[0] = newSize;
+    else u.s.size_ = newSize;
+  }
+private:
+  uint32_t getUtf16Char(uint16_t *&ptr) {
+    if (*ptr >= 0xD800 && *ptr <= 0xDBFF) {
+      uint32_t val = (*ptr << 10) & 0xFFC00;
+      ptr++;
+      if (*ptr >= 0xDC00 && *ptr <= 0xDFFF) {
+        val |= (*ptr & 0x3FF);
+        val += 0x10000;
+        ptr++;
+        return val;
+      } else {
+        return 0xFFFD;
+      }
+    } else if (*ptr >= 0xDC00 && *ptr <= 0xDFFF) {
+      ptr++;
+      return 0xFFFD;
+    } else {
+      uint16_t val = *ptr;
+      ptr++;
+      return val;
+    }
+  }
+  union {
+    struct {
+      size_t isLocal_;
+      size_t size_;
+      char *storage_;
+      size_t capacity_;
+    } s;
+    char localStorage_[32];
+  } u;
+};
+
+}
+
+#endif
+
+
